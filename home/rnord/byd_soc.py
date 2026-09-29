@@ -1,6 +1,6 @@
 import asyncio
 from bleak import BleakClient, BleakScanner
-from bleak.exc import BleakDeviceNotFoundError, BleakError
+from bleak.exc import BleakError
 import paho.mqtt.client as mqtt
 from datetime import datetime
 import json
@@ -26,15 +26,24 @@ POLL_INTERVAL = 900  # 15 minutes
 MQTT_KEEPALIVE = 1200  # 20 minutes
 RECONNECT_DELAY = 30  # seconds
 MAX_ECU_RETRIES = 3  # Max attempts per poll
+SCAN_TIMEOUT = 5  # seconds
+ELM_TIMEOUT = 3.0  # seconds to wait for the '>' prompt
+
+# ELM327 init sequence: echo off, headers on, spaces on, timeout 0x96,
+# CAN 11-bit/500k, request header 7E7, only accept replies from 7EF
+ELM_INIT = ["ATE0", "ATH1", "ATS1", "ATST96", "ATSP6", "ATSH7E7", "ATCRA7EF"]
 
 # Global MQTT client
 mqtt_client = None
+
+def ts():
+    return datetime.now().strftime('%H:%M:%S')
 
 def setup_mqtt():
     """Create the MQTT client with a Last Will"""
     global mqtt_client
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Sätter upp MQTT...")
+    print(f"[{ts()}] Sätter upp MQTT...")
 
     mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     mqtt_client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
@@ -42,16 +51,16 @@ def setup_mqtt():
     def on_connect(client, userdata, flags, reason_code, properties):
         # paho calls on_connect for a refused CONNACK too (e.g. bad credentials)
         if reason_code.is_failure:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ MQTT nekade anslutning: rc={reason_code}")
+            print(f"[{ts()}] ❌ MQTT nekade anslutning: rc={reason_code}")
             return
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] MQTT ansluten: rc={reason_code}")
+        print(f"[{ts()}] MQTT ansluten: rc={reason_code}")
         client.publish(MQTT_TOPIC_PI_STATUS, "online", qos=1, retain=True)
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] 📡 Pi status: online")
+        print(f"[{ts()}] 📡 Pi status: online")
 
     def on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] MQTT frånkopplad: rc={reason_code}")
+        print(f"[{ts()}] MQTT frånkopplad: rc={reason_code}")
         if reason_code.is_failure:
-            print(f"  ⚠️ Oväntad MQTT-frånkoppling!")
+            print("  ⚠️ Oväntad MQTT-frånkoppling!")
 
     mqtt_client.on_connect = on_connect
     mqtt_client.on_disconnect = on_disconnect
@@ -75,7 +84,7 @@ def publish_car_status(status: str):
     """Publish car status (connected/disconnected)"""
     if mqtt_client:
         mqtt_client.publish(MQTT_TOPIC_CAR_STATUS, status, qos=1, retain=True)
-        print(f"📡 [{datetime.now().strftime('%H:%M:%S')}] Bilstatus: {status}")
+        print(f"📡 [{ts()}] Bilstatus: {status}")
 
 def publish_soc(soc: int):
     """Publish SoC"""
@@ -85,154 +94,134 @@ def publish_soc(soc: int):
         result = mqtt_client.publish(MQTT_TOPIC_SOC, payload=payload, qos=1, retain=True)
         print(f"🔍 MQTT publish result: {result.rc}")
 
+def parse_soc(response: str) -> int:
+    """Extract the SoC percentage from a UDS '62 00 05 XX' response"""
+    if not response:
+        raise RuntimeError("Inget svar från ECU")
+
+    tokens = response.replace("\r", " ").replace(">", " ").split()
+
+    if "62" not in tokens:
+        raise RuntimeError("Ogiltigt svar")
+
+    idx = tokens.index("62")
+    if len(tokens) <= idx+3 or tokens[idx+1] != "00" or tokens[idx+2] != "05":
+        raise RuntimeError("Fel DID")
+
+    # ValueError from int() means the SoC token was not hex (e.g. '<DATA ERROR')
+    return int(tokens[idx+3], 16)
+
+async def find_device():
+    """Scan for the OBD dongle; returns the BLEDevice or None when out of range"""
+    print("  🔍 Skannar efter OBD BLE...")
+    for d in await BleakScanner.discover(timeout=SCAN_TIMEOUT):
+        if d.address == DEVICE_MAC:
+            print(f"  ✓ Hittade {d.name}")
+            return d
+    return None
+
+async def run_session(device):
+    """Connect BLE, initialise the ELM and poll SoC until the connection drops"""
+    ble_lost = asyncio.Event()
+
+    # Passing the BLEDevice (not the MAC) lets bleak connect without a second scan
+    async with BleakClient(device, timeout=30,
+                           disconnected_callback=lambda _: ble_lost.set()) as client:
+        print(f"✓ [{ts()}] BLE ansluten")
+        publish_car_status("connected")
+
+        rx_buffer = ""
+        prompt_received = asyncio.Event()
+
+        def on_notify(_, data: bytearray):
+            nonlocal rx_buffer
+            rx_buffer += data.decode(errors="ignore")
+            # The ELM327 ends every response with a '>' prompt
+            if ">" in rx_buffer:
+                prompt_received.set()
+
+        await client.start_notify(READ_CHAR, on_notify)
+
+        async def send(cmd, timeout=ELM_TIMEOUT):
+            """Write a command, wait for the ELM prompt (or the timeout) and return the response"""
+            nonlocal rx_buffer
+            rx_buffer = ""
+            prompt_received.clear()
+            await client.write_gatt_char(WRITE_CHAR, (cmd + "\r").encode())
+            try:
+                await asyncio.wait_for(prompt_received.wait(), timeout)
+            except asyncio.TimeoutError:
+                pass
+            return rx_buffer
+
+        # ELM init (once per connection)
+        print(f"[{ts()}] Initierar ELM327...")
+        await send("ATZ", 5)
+        for cmd in ELM_INIT:
+            await send(cmd)
+        print(f"✓ [{ts()}] ELM327 initierad")
+
+        poll_count = 0
+        while True:
+            poll_count += 1
+            print(f"\n🔄 [{ts()}] Poll #{poll_count}")
+
+            for retry in range(MAX_ECU_RETRIES):
+                try:
+                    if retry > 0:
+                        print(f"  ↻ Retry {retry}/{MAX_ECU_RETRIES-1}")
+                        await asyncio.sleep(2)
+
+                    soc = parse_soc(await send("220005"))
+                    print(f"  🔋 SoC: {soc}%")
+                    publish_soc(soc)
+                    break
+
+                except (RuntimeError, ValueError) as e:
+                    print(f"  ⚠️ ECU-fel: {e}")
+            else:
+                print(f"  ❌ Gav upp efter {MAX_ECU_RETRIES} försök")
+                print("  💤 Bilen svarar inte, väntar till nästa poll")
+
+            # Wait until the next poll, but wake up at once if BLE drops
+            print(f"⏱️  Väntar {POLL_INTERVAL//60} minuter till nästa poll...")
+            try:
+                await asyncio.wait_for(ble_lost.wait(), POLL_INTERVAL)
+            except asyncio.TimeoutError:
+                continue
+            raise BleakError("BLE-anslutningen tappades")
+
 async def poll_loop():
-    """Main loop: connect BLE, initialise the ELM, poll SoC"""
+    """Main loop: find the dongle, run a session, wait, repeat"""
     while True:
-        print(f"\n🔁 [{datetime.now().strftime('%H:%M:%S')}] Försöker ansluta BLE...")
+        print(f"\n🔁 [{ts()}] Försöker ansluta BLE...")
 
         try:
-            # Scan first to "wake" the device
-            print(f"  🔍 Skannar efter OBD BLE...")
-            devices = await BleakScanner.discover(timeout=5)
-            
-            found = False
-            for d in devices:
-                if d.address == DEVICE_MAC:
-                    print(f"  ✓ Hittade {d.name}")
-                    found = True
-                    break
-            
-            if not found:
-                print(f"  ⚙️ Enheten hittades inte i scan (bilen utom räckvidd)")
-                raise BleakDeviceNotFoundError(DEVICE_MAC, "Not found in scan")
-            
-            # Now connect
-            ble_lost = asyncio.Event()
+            device = await find_device()
+            if device is None:
+                # Silent - the car is just out of range
+                print("  ⚙️ Enheten hittades inte (bilen utom räckvidd)")
+            else:
+                await run_session(device)
 
-            async with BleakClient(DEVICE_MAC, timeout=30,
-                                   disconnected_callback=lambda _: ble_lost.set()) as client:
-                print(f"✓ [{datetime.now().strftime('%H:%M:%S')}] BLE ansluten")
-                publish_car_status("connected")
-
-                rx_buffer = ""
-                prompt_received = asyncio.Event()
-
-                def on_notify(_, data: bytearray):
-                    nonlocal rx_buffer
-                    rx_buffer += data.decode(errors="ignore")
-                    # The ELM327 ends every response with a '>' prompt
-                    if ">" in rx_buffer:
-                        prompt_received.set()
-
-                await client.start_notify(READ_CHAR, on_notify)
-
-                async def send(cmd, timeout=3.0):
-                    """Write a command and wait for the ELM prompt (or the timeout)"""
-                    nonlocal rx_buffer
-                    rx_buffer = ""
-                    prompt_received.clear()
-                    await client.write_gatt_char(WRITE_CHAR, (cmd + "\r").encode())
-                    try:
-                        await asyncio.wait_for(prompt_received.wait(), timeout)
-                    except asyncio.TimeoutError:
-                        pass
-
-                # ELM init (once per connection)
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Initierar ELM327...")
-                await send("ATZ", 5)
-                await send("ATE0")
-                await send("ATH1")
-                await send("ATS1")
-                await send("ATST96")
-                await send("ATSP6")
-                await send("ATSH7E7")
-                await send("ATCRA7EF")
-                print(f"✓ [{datetime.now().strftime('%H:%M:%S')}] ELM327 initierad")
-
-                # Polling loop (inside the BLE connection)
-                poll_count = 0
-                
-                while True:
-                    poll_count += 1
-                    print(f"\n🔄 [{datetime.now().strftime('%H:%M:%S')}] Poll #{poll_count}")
-                    
-                    # Try to read SoC with retries
-                    success = False
-                    for retry in range(MAX_ECU_RETRIES):
-                        try:
-                            if retry > 0:
-                                print(f"  ↻ Retry {retry}/{MAX_ECU_RETRIES-1}")
-                                await asyncio.sleep(2)
-
-                            await send("220005")
-
-                            if not rx_buffer:
-                                raise RuntimeError("Inget svar från ECU")
-
-                            tokens = rx_buffer.replace("\r", " ").replace(">", " ").split()
-
-                            if "62" not in tokens:
-                                raise RuntimeError("Ogiltigt svar")
-
-                            idx = tokens.index("62")
-                            if len(tokens) <= idx+3 or tokens[idx+1] != "00" or tokens[idx+2] != "05":
-                                raise RuntimeError("Fel DID")
-
-                            soc = int(tokens[idx+3], 16)
-                            print(f"  🔋 SoC: {soc}%")
-
-                            publish_soc(soc)
-                            mqtt_client.publish(MQTT_TOPIC_PI_STATUS, "online", qos=1, retain=True)
-
-                            success = True
-                            break
-
-                        except (RuntimeError, ValueError) as e:
-                            # ValueError: the SoC token was not hex (e.g. '<DATA ERROR')
-                            print(f"  ⚠️ ECU-fel: {e}")
-                            if retry == MAX_ECU_RETRIES - 1:
-                                print(f"  ❌ Gav upp efter {MAX_ECU_RETRIES} försök")
-
-                    if not success:
-                        print(f"  💤 Bilen svarar inte, väntar till nästa poll")
-
-                    # Wait until the next poll, but wake up at once if BLE drops
-                    print(f"⏱️  Väntar {POLL_INTERVAL//60} minuter till nästa poll...")
-                    try:
-                        await asyncio.wait_for(ble_lost.wait(), POLL_INTERVAL)
-                    except asyncio.TimeoutError:
-                        continue
-                    raise BleakError("BLE-anslutningen tappades")
-
-                # Reaching this point means the while loop was broken
-                try:
-                    await client.stop_notify(READ_CHAR)
-                except:
-                    pass
-
-        except BleakDeviceNotFoundError:
-            # Silent error - the car is just out of range
-            print(f"  ⚙️ Enheten hittades inte (bilen utom räckvidd)")
-            
         except BleakError as e:
-            # Other BLE errors
-            print(f"⚠️ [{datetime.now().strftime('%H:%M:%S')}] BLE-fel: {e}")
+            print(f"⚠️ [{ts()}] BLE-fel: {e}")
             publish_car_status("disconnected")
-            
+
         except Exception as e:
             # Unexpected error - log everything
-            print(f"⚠️ [{datetime.now().strftime('%H:%M:%S')}] Oväntat fel: {e}")
+            print(f"⚠️ [{ts()}] Oväntat fel: {e}")
             publish_car_status("disconnected")
             traceback.print_exc()
 
         # Wait before reconnecting
-        print(f"⏳ [{datetime.now().strftime('%H:%M:%S')}] Väntar {RECONNECT_DELAY}s innan BLE-reconnect...")
+        print(f"⏳ [{ts()}] Väntar {RECONNECT_DELAY}s innan BLE-reconnect...")
         await asyncio.sleep(RECONNECT_DELAY)
 
 async def main():
     print("🚗 BYD Dolphin SoC Monitor")
     print(f"📡 MQTT: {MQTT_HOST}:{MQTT_PORT}")
-    print(f"   Topics:")
+    print("   Topics:")
     print(f"     - {MQTT_TOPIC_SOC} (SoC)")
     print(f"     - {MQTT_TOPIC_PI_STATUS} (Pi status)")
     print(f"     - {MQTT_TOPIC_CAR_STATUS} (Car connection)")
@@ -254,13 +243,13 @@ async def main():
     try:
         await poll_loop()
     except asyncio.CancelledError:
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Stoppsignal mottagen")
+        print(f"\n[{ts()}] Stoppsignal mottagen")
     except Exception as e:
         print(f"❌ KRITISKT FEL: {e}")
         traceback.print_exc()
     finally:
         # Clean up on exit
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Avslutar...")
+        print(f"[{ts()}] Avslutar...")
         if mqtt_client:
             publish_car_status("disconnected")
             info = mqtt_client.publish(MQTT_TOPIC_PI_STATUS, "offline", qos=1, retain=True)
