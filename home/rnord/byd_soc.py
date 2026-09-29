@@ -5,6 +5,7 @@ import paho.mqtt.client as mqtt
 from datetime import datetime
 import json
 import os
+import signal
 import traceback
 
 # Configuration
@@ -38,18 +39,18 @@ def setup_mqtt():
     mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     mqtt_client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
 
-    connected = False
-
     def on_connect(client, userdata, flags, reason_code, properties):
-        nonlocal connected
+        # paho calls on_connect for a refused CONNACK too (e.g. bad credentials)
+        if reason_code.is_failure:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ MQTT nekade anslutning: rc={reason_code}")
+            return
         print(f"[{datetime.now().strftime('%H:%M:%S')}] MQTT ansluten: rc={reason_code}")
-        connected = True
         client.publish(MQTT_TOPIC_PI_STATUS, "online", qos=1, retain=True)
         print(f"[{datetime.now().strftime('%H:%M:%S')}] 📡 Pi status: online")
 
     def on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
         print(f"[{datetime.now().strftime('%H:%M:%S')}] MQTT frånkopplad: rc={reason_code}")
-        if reason_code != 0:
+        if reason_code.is_failure:
             print(f"  ⚠️ Oväntad MQTT-frånkoppling!")
 
     mqtt_client.on_connect = on_connect
@@ -63,25 +64,12 @@ def setup_mqtt():
         retain=True
     )
 
-    try:
-        mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=MQTT_KEEPALIVE)
-        mqtt_client.loop_start()
-
-        # Wait for the connection
-        import time
-        timeout = 5
-        while not connected and timeout > 0:
-            time.sleep(0.1)
-            timeout -= 0.1
-
-        if not connected:
-            print("⚠️ MQTT-anslutning timeout!")
-        else:
-            print("✓ MQTT setup klar")
-
-    except Exception as e:
-        print(f"❌ MQTT-anslutning misslyckades: {e}")
-        traceback.print_exc()
+    # connect_async + loop_start makes paho's network thread retry the first
+    # connection until it succeeds, so a broker that is down at boot is not fatal.
+    # QoS 1 publishes made while offline are queued and sent after (re)connect.
+    mqtt_client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=MQTT_KEEPALIVE)
+    mqtt_client.loop_start()
+    print("✓ MQTT setup klar")
 
 def publish_car_status(status: str):
     """Publish car status (connected/disconnected)"""
@@ -119,27 +107,39 @@ async def poll_loop():
                 raise BleakDeviceNotFoundError(DEVICE_MAC, "Not found in scan")
             
             # Now connect
-            async with BleakClient(DEVICE_MAC, timeout=30) as client:
+            ble_lost = asyncio.Event()
+
+            async with BleakClient(DEVICE_MAC, timeout=30,
+                                   disconnected_callback=lambda _: ble_lost.set()) as client:
                 print(f"✓ [{datetime.now().strftime('%H:%M:%S')}] BLE ansluten")
                 publish_car_status("connected")
 
                 rx_buffer = ""
+                prompt_received = asyncio.Event()
 
                 def on_notify(_, data: bytearray):
                     nonlocal rx_buffer
                     rx_buffer += data.decode(errors="ignore")
+                    # The ELM327 ends every response with a '>' prompt
+                    if ">" in rx_buffer:
+                        prompt_received.set()
 
                 await client.start_notify(READ_CHAR, on_notify)
 
-                async def send(cmd, wait=1.0):
+                async def send(cmd, timeout=3.0):
+                    """Write a command and wait for the ELM prompt (or the timeout)"""
                     nonlocal rx_buffer
                     rx_buffer = ""
+                    prompt_received.clear()
                     await client.write_gatt_char(WRITE_CHAR, (cmd + "\r").encode())
-                    await asyncio.sleep(wait)
+                    try:
+                        await asyncio.wait_for(prompt_received.wait(), timeout)
+                    except asyncio.TimeoutError:
+                        pass
 
                 # ELM init (once per connection)
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Initierar ELM327...")
-                await send("ATZ", 2)
+                await send("ATZ", 5)
                 await send("ATE0")
                 await send("ATH1")
                 await send("ATS1")
@@ -164,7 +164,7 @@ async def poll_loop():
                                 print(f"  ↻ Retry {retry}/{MAX_ECU_RETRIES-1}")
                                 await asyncio.sleep(2)
 
-                            await send("220005", 1.0)
+                            await send("220005")
 
                             if not rx_buffer:
                                 raise RuntimeError("Inget svar från ECU")
@@ -187,7 +187,8 @@ async def poll_loop():
                             success = True
                             break
 
-                        except RuntimeError as e:
+                        except (RuntimeError, ValueError) as e:
+                            # ValueError: the SoC token was not hex (e.g. '<DATA ERROR')
                             print(f"  ⚠️ ECU-fel: {e}")
                             if retry == MAX_ECU_RETRIES - 1:
                                 print(f"  ❌ Gav upp efter {MAX_ECU_RETRIES} försök")
@@ -195,9 +196,13 @@ async def poll_loop():
                     if not success:
                         print(f"  💤 Bilen svarar inte, väntar till nästa poll")
 
-                    # Wait until the next poll
+                    # Wait until the next poll, but wake up at once if BLE drops
                     print(f"⏱️  Väntar {POLL_INTERVAL//60} minuter till nästa poll...")
-                    await asyncio.sleep(POLL_INTERVAL)
+                    try:
+                        await asyncio.wait_for(ble_lost.wait(), POLL_INTERVAL)
+                    except asyncio.TimeoutError:
+                        continue
+                    raise BleakError("BLE-anslutningen tappades")
 
                 # Reaching this point means the while loop was broken
                 try:
@@ -238,8 +243,18 @@ async def main():
     # Set up MQTT with a Last Will
     setup_mqtt()
 
+    # A fresh process never has a BLE connection, so clear any retained
+    # 'connected' left behind by a previous process that was killed.
+    publish_car_status("disconnected")
+
+    # systemd stops us with SIGTERM; cancel the main task so the cleanup below runs
+    main_task = asyncio.current_task()
+    asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, main_task.cancel)
+
     try:
         await poll_loop()
+    except asyncio.CancelledError:
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Stoppsignal mottagen")
     except Exception as e:
         print(f"❌ KRITISKT FEL: {e}")
         traceback.print_exc()
@@ -248,9 +263,10 @@ async def main():
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Avslutar...")
         if mqtt_client:
             publish_car_status("disconnected")
-            mqtt_client.publish(MQTT_TOPIC_PI_STATUS, "offline", qos=1, retain=True)
-            mqtt_client.loop_stop()
+            info = mqtt_client.publish(MQTT_TOPIC_PI_STATUS, "offline", qos=1, retain=True)
+            info.wait_for_publish(timeout=2)
             mqtt_client.disconnect()
+            mqtt_client.loop_stop()
 
 if __name__ == "__main__":
     try:
