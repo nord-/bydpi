@@ -1,0 +1,18 @@
+[Unit]
+Description=BYD Dolphin SoC Monitor
+After=network-online.target bluetooth.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rnord
+WorkingDirectory=/home/rnord
+EnvironmentFile=/home/rnord/.env
+ExecStart=/home/rnord/venvs/byd/bin/python -u /home/rnord/byd_soc.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
