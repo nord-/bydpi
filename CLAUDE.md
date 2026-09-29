@@ -35,11 +35,11 @@ Dependencies: `home/rnord/requirements.txt` is a `pip freeze` of the Pi venv. On
 ## How `byd_soc.py` works
 
 - **Config and secrets:** constants at the top of the file. `MQTT_USER` and `MQTT_PASSWORD` come from `~/.env`. systemd loads it via `EnvironmentFile=` in `byd-soc.service`, and `activate_byd.sh` exports it for manual runs. The script raises `KeyError` at import time if they are missing.
-- **Two nested loops in `poll_loop()`:** the outer loop scans for the dongle MAC, connects BLE and runs the ELM327 init (`ATSP6` CAN 11-bit/500k, header `7E7`, receive filter `7EF`). The inner loop polls UDS `22 00 05` every `POLL_INTERVAL` (15 min) *inside the same BLE connection*. It leaves only on an exception, and the outer loop then reconnects after `RECONNECT_DELAY`.
-- **Response parsing:** notifications accumulate in `rx_buffer`. `send()` clears it, writes the command and sleeps a fixed time instead of waiting for the `>` prompt. The SoC is the byte after `62 00 05`, read as a percentage. When the car is asleep, the dongle stays connected but the ECU gives no valid answer (`Ogiltigt svar`), so the retries fail every poll without a reconnect.
-- **MQTT:** `paho-mqtt` 2.x with `CallbackAPIVersion.VERSION2`, `loop_start()` background thread, all messages QoS 1 and retained:
+- **Three layers:** `poll_loop()` calls `find_device()` (5 s scan for the dongle MAC) and, when found, `run_session()`, which connects BLE, runs the ELM327 init (`ATSP6` CAN 11-bit/500k, header `7E7`, receive filter `7EF`) and polls UDS `22 00 05` every `POLL_INTERVAL` (15 min) *inside the same BLE connection*. A bleak `disconnected_callback` wakes the poll sleep at once when the car leaves; the session ends only by exception, and `poll_loop()` reconnects after `RECONNECT_DELAY`.
+- **Response parsing:** notifications accumulate in `rx_buffer`. `send()` clears it, writes the command and waits for the ELM `>` prompt (or `ELM_TIMEOUT`), then `parse_soc()` reads the byte after `62 00 05` as a percentage. `parse_soc()` is pure and the only unit-testable piece. When the car is asleep, the dongle stays connected but the ECU gives no valid answer (`Ogiltigt svar`), so the retries fail every poll without a reconnect.
+- **MQTT:** `paho-mqtt` 2.x with `CallbackAPIVersion.VERSION2`, `connect_async()` + `loop_start()` so the network thread retries a broker that is down at boot; QoS 1 publishes made while offline are queued. All messages QoS 1 and retained:
   - `byd/soc`: JSON `{"soc": <int>}`
-  - `byd/car_status`: `connected` / `disconnected`, i.e. BLE state, not whether the car is awake
+  - `byd/car_status`: `connected` / `disconnected`, i.e. BLE state, not whether the car is awake. Published as `disconnected` at startup and on SIGTERM (handled via `add_signal_handler`) so a restart never leaves a stale retained `connected`. Home Assistant automations trigger on this value, so keep the topic and the two strings as they are.
   - `byd/pi_status`: `online` / `offline`; `offline` is also the Last Will
 - Log output is in Swedish with emoji and goes to the journal through `print` (`python -u`). Code comments are in English.
 
