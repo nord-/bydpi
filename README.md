@@ -25,6 +25,7 @@ Everything goes to MQTT with QoS 1 and the retained flag:
 - `home/rnord/.env.example`: template for `~/.env`, which holds `MQTT_USER` and `MQTT_PASSWORD` and is not committed.
 - `etc/systemd/system/byd-soc.service`: runs the script as user `rnord` with `EnvironmentFile=/home/rnord/.env` and `Restart=always`.
 - `etc/systemd/system/bt-unblock.service`: unblocks the Bluetooth adapter at boot.
+- `etc/ssh/sshd_config.d/10-key-only.conf`: key-only SSH login (password and keyboard-interactive auth off).
 
 ## Setting up a Pi
 
@@ -41,6 +42,13 @@ Adjust `DEVICE_MAC` and `MQTT_HOST` at the top of `byd_soc.py`, copy the files t
 sudo systemctl daemon-reload
 sudo systemctl enable --now bt-unblock.service byd-soc.service
 journalctl -u byd-soc -f
+```
+
+For key-only SSH, add your public key to `~/.ssh/authorized_keys` on the Pi and check that a key login works before you install the sshd drop-in. Keep the current session open until a new key login succeeds:
+
+```bash
+sudo install -m 644 etc/ssh/sshd_config.d/10-key-only.conf /etc/ssh/sshd_config.d/
+sudo sshd -t && sudo systemctl reload ssh
 ```
 
 ## Running by hand
