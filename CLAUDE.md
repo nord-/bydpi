@@ -58,5 +58,6 @@ Dependencies: `home/rnord/requirements.txt` is a `pip freeze` of the Pi venv. On
 
 - `bt-unblock.service`: runs `rfkill unblock` + `hciconfig hci0 up` at boot so the adapter is usable.
 - `etc/ssh/sshd_config.d/10-key-only.conf`: turns off password and keyboard-interactive login. sshd keeps the first value it reads and drop-ins come before the rest of `sshd_config`, so a file with a lower prefix that says `PasswordAuthentication yes` would override it.
+- `research/`: git-ignored, local only. Raw probe data from the car (it contains the VIN, and the repo is public), e.g. `research/odometer-2026-11-08/` with every positive UDS answer from the odometer scan and the probe scripts. Read it before probing the car again.
 - `home/rnord/EVNotifyBackend/`: only `createEnv.sh` from an unmodified clone of the upstream EVNotify repo. Nothing on the Pi runs it (no node process, no Docker containers).
 - Line endings are LF (`.gitattributes`) because everything runs on Linux.
