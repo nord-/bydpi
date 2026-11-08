@@ -18,13 +18,13 @@ There is no build, lint or test setup. The code needs BlueZ and the car's dongle
 # Push code + credentials (the .env is git-ignored and must be copied explicitly)
 scp home/rnord/byd_soc.py home/rnord/activate_byd.sh home/rnord/.env bydpi:~/
 
-# Unit changes need sudo, which prompts for a password, so the user has to run this step (`! ssh -t ...`)
+# Unit changes (sudo is NOPASSWD for rnord, so this works over plain non-interactive ssh)
 scp etc/systemd/system/byd-soc.service bydpi:/tmp/
-ssh -t bydpi "sudo mv /tmp/byd-soc.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl restart byd-soc"
+ssh bydpi "sudo mv /tmp/byd-soc.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl restart byd-soc"
 
-# sshd drop-in (sudo, user runs it). sshd -t validates before the reload; on failure the file is removed again
+# sshd drop-in. sshd -t validates before the reload; on failure the file is removed again
 scp etc/ssh/sshd_config.d/10-key-only.conf bydpi:/tmp/
-ssh -t bydpi "sudo install -m 644 /tmp/10-key-only.conf /etc/ssh/sshd_config.d/ && { sudo sshd -t && sudo systemctl reload ssh || { sudo rm /etc/ssh/sshd_config.d/10-key-only.conf; echo 'sshd -t failed, rolled back'; }; }"
+ssh bydpi "sudo install -m 644 /tmp/10-key-only.conf /etc/ssh/sshd_config.d/ && { sudo sshd -t && sudo systemctl reload ssh || { sudo rm /etc/ssh/sshd_config.d/10-key-only.conf; echo 'sshd -t failed, rolled back'; }; }"
 
 # Logs and drift check
 ssh bydpi 'journalctl -u byd-soc -n 50 --no-pager'
@@ -46,6 +46,13 @@ Dependencies: `home/rnord/requirements.txt` is a `pip freeze` of the Pi venv. On
   - `byd/car_status`: `connected` / `disconnected`, i.e. BLE state, not whether the car is awake. Published as `disconnected` at startup and on SIGTERM (handled via `add_signal_handler`) so a restart never leaves a stale retained `connected`. Home Assistant automations trigger on this value, so keep the topic and the two strings as they are.
   - `byd/pi_status`: `online` / `offline`; `offline` is also the Last Will
 - Log output is in Swedish with emoji and goes to the journal through `print` (`python -u`). Code comments are in English.
+
+## BLE and probing pitfalls
+
+- **Connect timeouts are normal.** `BleakClient.connect()` often raises `TimeoutError` even while the dongle is advertising. Over 30 days the journal had about 950, in runs of usually 1–2 attempts (longest 17, about 17 min), and every run cleared by itself through the `RECONNECT_DELAY` retry. They show up as `Oväntat fel: TimeoutError()`. If a manual probe keeps timing out, `sudo systemctl restart bluetooth` clears it at once, but waiting usually works too.
+- **One BLE client at a time.** Stop `byd-soc` (`ssh bydpi 'sudo systemctl stop byd-soc'`) before probing the car, and start it again afterwards. A probe that ends with `EOFError` from `dbus_fast` in `disconnect()` is harmless, but the next connect may time out a few times.
+- **The dongle is an ELM327 v1.5 clone and cannot filter monitored traffic.** Unfiltered `ATMA` shows broadcast frames but soon hits `BUFFER FULL`, and with `ATCRA` or `ATCF`/`ATCM` set, `ATMA` returns nothing. So broadcast signals such as the odometer frame `0x3D9` that OVMS reads on the Atto 3 cannot be read with this dongle. Request/response UDS (`ATSH` + `ATCRA` + `22xxxx`) works fine.
+- **ECUs on the OBD port** (physical request ID, replies on ID + 8) that answered `22 F190` on 2026-11-08: 711, 720, 723, 725, 741, 754, 760, 761, 762, 794, 7A7, 7B3, 7C2, 7D4, 7D6, 7E0, 7E2, 7E3, 7E7. Standard OBD mode 01 is answered by 7E8 (PID `0D` only) and 7EB (`7F 01 22`). The odometer was not found; see issue #1 for what was tried.
 
 ## Other files
 

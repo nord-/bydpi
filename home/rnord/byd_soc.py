@@ -209,8 +209,9 @@ async def poll_loop():
             publish_car_status("disconnected")
 
         except Exception as e:
-            # Unexpected error - log everything
-            print(f"⚠️ [{ts()}] Oväntat fel: {e}")
+            # Unexpected error - log everything. repr, since str() of e.g. a
+            # bleak connect TimeoutError is empty
+            print(f"⚠️ [{ts()}] Oväntat fel: {e!r}")
             publish_car_status("disconnected")
             traceback.print_exc()
 
